@@ -1,0 +1,175 @@
+# Skiplink — accessibility gate for GitHub Actions.
+#
+# A composite action rather than a bundled JavaScript one. A JS action has to
+# ship its dependencies as a committed dist/ bundle, which means the thing users
+# actually execute is a megabyte of generated code nobody reviews. The CLI has
+# zero runtime dependencies, so `npx` fetches one small package and everything
+# that runs here is readable in this file.
+
+name: 'Skiplink Accessibility Gate'
+description: 'Run axe-core against your URLs and fail the pull request only on accessibility violations you have not already accepted.'
+author: 'Farid Mammadov'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  urls:
+    description: 'URLs to scan. One per line, or space-separated.'
+    required: true
+  token:
+    description: 'Skiplink API key. Store it as a repository secret.'
+    required: true
+  baseline:
+    description: >
+      Path to the committed baseline file. Violations listed in it do not fail
+      the build. Leave unset to fail on every violation at or above fail-on.
+    required: false
+    default: ''
+  fail-on:
+    description: 'new | critical | serious | moderate | minor | never'
+    required: false
+    default: 'new'
+  standard:
+    description: 'wcag22aa | wcag21aa | wcag2aa | wcag2a | section508 | all'
+    required: false
+    default: 'wcag22aa'
+  wait-for:
+    description: 'CSS selector to wait for before scanning. For apps that render late.'
+    required: false
+    default: ''
+  comment:
+    description: >
+      Post the report as a pull request comment, updating the same comment on
+      each run rather than adding a new one. Needs pull-requests: write.
+    required: false
+    default: 'true'
+  api:
+    description: 'API base URL. Leave unset to use the hosted API at https://api.skiplink.dev.'
+    required: false
+    default: ''
+  cli-version:
+    description: 'Version of @skiplink/cli to run. Pin this for reproducible builds.'
+    required: false
+    default: 'latest'
+
+outputs:
+  passed:
+    description: 'true when the gate passed'
+    value: ${{ steps.scan.outputs.passed }}
+  new-violations:
+    description: 'Count of violations not present in the baseline'
+    value: ${{ steps.scan.outputs.new_violations }}
+  report:
+    description: 'Path to the markdown report'
+    value: ${{ steps.scan.outputs.report }}
+  exit-code:
+    description: 'The CLI exit code: 0 passed, 1 gate failed, 2 misconfigured, 3 could not complete'
+    value: ${{ steps.scan.outputs.exit_code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check Node is available
+      shell: bash
+      run: |
+        if ! command -v node > /dev/null; then
+          echo "::error::Skiplink needs Node 20+. Add actions/setup-node before this step."
+          exit 1
+        fi
+
+    - name: Run Skiplink
+      id: scan
+      shell: bash
+      # Every input reaches the script through the environment, never by ${{ }}
+      # interpolation into the script text. A URL can come from a previous step's
+      # output — a preview deployment, say — and interpolating it would let whoever
+      # controls that string run shell commands in this job.
+      env:
+        SKIPLINK_TOKEN: ${{ inputs.token }}
+        SKIPLINK_API: ${{ inputs.api }}
+        IN_URLS: ${{ inputs.urls }}
+        IN_STANDARD: ${{ inputs.standard }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_BASELINE: ${{ inputs.baseline }}
+        IN_WAIT_FOR: ${{ inputs.wait-for }}
+        IN_CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -o pipefail
+
+        # Accept URLs newline- or space-separated; both read naturally in YAML.
+        read -r -a urls <<< "$(printf '%s' "$IN_URLS" | tr '\n' ' ')"
+        if [ "${#urls[@]}" -eq 0 ]; then
+          echo "::error::No urls given to skiplink/action. Set the 'urls' input."
+          exit 1
+        fi
+        if [ -z "$SKIPLINK_TOKEN" ]; then
+          echo "::error::No token given to skiplink/action. Add your API key as a repository secret and pass it as 'token'."
+          exit 1
+        fi
+
+        args=(scan "${urls[@]}" --standard "$IN_STANDARD" --fail-on "$IN_FAIL_ON" --format github)
+        [ -n "$IN_BASELINE" ] && args+=(--baseline "$IN_BASELINE")
+        [ -n "$IN_WAIT_FOR" ] && args+=(--wait-for "$IN_WAIT_FOR")
+
+        report="${RUNNER_TEMP}/skiplink-report.md"
+        args+=(--comment-file "$report")
+
+        # Do not let a non-zero exit abort the step before the outputs are set —
+        # the comment and the summary are most wanted precisely when the gate
+        # fails, and losing them would make a red build harder to act on.
+        set +e
+        npx --yes "@skiplink/cli@${IN_CLI_VERSION}" "${args[@]}"
+        code=$?
+        set -e
+
+        # passed / new_violations are written to $GITHUB_OUTPUT by the CLI itself.
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+    - name: Comment on the pull request
+      # A fork's pull request gets a read-only token, so the comment cannot be posted;
+      # the job summary still carries the full report.
+      if: ${{ inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPORT: ${{ steps.scan.outputs.report }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        report="$REPORT"
+        [ -f "$report" ] || exit 0
+
+        # A marker so each run edits its own comment instead of adding another.
+        # A gate that posts a fresh comment on every push is a gate people mute.
+        marker="<!-- skiplink-report -->"
+        printf '%s\n' "$marker" | cat - "$report" > "${report}.tagged"
+
+        existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+
+        if [ -n "$existing" ]; then
+          gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+            -F body=@"${report}.tagged" > /dev/null
+        else
+          gh api --method POST "repos/$REPO/issues/$PR/comments" \
+            -F body=@"${report}.tagged" > /dev/null
+        fi
+
+    - name: Fail the build
+      if: ${{ steps.scan.outputs.exit_code != '0' }}
+      shell: bash
+      env:
+        CODE: ${{ steps.scan.outputs.exit_code }}
+      run: |
+        # Exit codes are the CLI's contract: 1 means the gate found something new,
+        # anything else means the scan could not be completed. Keeping them apart
+        # lets a workflow treat an outage differently from a regression.
+        case "$CODE" in
+          1) echo "::error::Skiplink gate failed — new accessibility violations. See the pull request comment." ;;
+          2) echo "::error::Skiplink was misconfigured. Check the inputs on this step." ;;
+          *) echo "::error::Skiplink could not complete the scan. This is not a gate failure." ;;
+        esac
+        exit 1
